@@ -1,0 +1,873 @@
+"""Georreferenciamento: validação das coordenadas oficiais + geocodificação de reserva (Nominatim/OSM)."""
+import asyncio
+import re
+import time
+
+import httpx
+
+from .config import Settings
+
+
+def parse_coord(value) -> float | None:
+    """Aceita número, '-8,0476', ' -8.0476 '. Rejeita vazio e 0 (valor típico de 'sem dado')."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+    else:
+        txt = str(value).strip().replace(",", ".")
+        if not re.fullmatch(r"[-+]?\d+(\.\d+)?", txt):
+            return None
+        num = float(txt)
+    return None if num == 0 else num
+
+
+def _inside(settings: Settings, lat: float, lng: float) -> bool:
+    return (
+        settings.geo_min_lat <= lat <= settings.geo_max_lat
+        and settings.geo_min_lng <= lng <= settings.geo_max_lng
+    )
+
+
+def validate_coords(settings: Settings, lat_raw, lng_raw) -> tuple[float, float] | None:
+    """Devolve (lat, lng) válidos para o Recife, corrigindo erros comuns de cadastro:
+    sinal perdido e latitude/longitude invertidas. Se nada serve, devolve None."""
+    lat, lng = parse_coord(lat_raw), parse_coord(lng_raw)
+    if lat is None or lng is None:
+        return None
+    candidates = [
+        (lat, lng),
+        (-abs(lat), -abs(lng)),  # sinal perdido
+        (lng, lat),  # invertidas
+        (-abs(lng), -abs(lat)),
+    ]
+    for c_lat, c_lng in candidates:
+        if _inside(settings, c_lat, c_lng):
+            return round(c_lat, 6), round(c_lng, 6)
+    return None
+
+
+class Geocoder:
+    """Nominatim (OpenStreetMap) com cache, 1 req/s e limite por sincronização.
+    Só é usado para unidades SEM coordenada válida na base oficial."""
+
+    def __init__(self, settings: Settings, db, transport: httpx.AsyncBaseTransport | None = None):
+        self.s, self.db, self.transport = settings, db, transport
+        self.calls = 0
+        self._last = 0.0
+
+    async def geocode(self, address: str, neighborhood: str) -> tuple[float, float] | None:
+        if not self.s.geocode_enabled or not address.strip():
+            return None
+        key = f"{address}|{neighborhood}".lower()
+        cached = self.db.geocode_cache_get(key, self.s.geocode_retry_days)
+        if cached is not None:
+            return cached or None  # () = falha já conhecida
+        if self.calls >= self.s.geocode_max_per_sync:
+            return None
+        self.calls += 1
+        wait = 1.1 - (time.monotonic() - self._last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last = time.monotonic()
+        params = {
+            "q": f"{address}, {neighborhood}, Recife, PE, Brasil".replace(" ,", ","),
+            "format": "jsonv2",
+            "limit": 1,
+            "countrycodes": "br",
+            "viewbox": f"{self.s.geo_min_lng},{self.s.geo_max_lat},{self.s.geo_max_lng},{self.s.geo_min_lat}",
+            "bounded": 1,
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=15, transport=self.transport, headers={"User-Agent": self.s.nominatim_user_agent}
+            ) as client:
+                resp = await client.get(self.s.nominatim_url, params=params)
+                resp.raise_for_status()
+                hits = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return None  # erro transitório: não grava cache negativo
+        found = validate_coords(self.s, hits[0].get("lat"), hits[0].get("lon")) if hits else None
+        self.db.geocode_cache_put(key, found)
+        return found
+
+"""Sincronização: CKAN -> normalização -> geocodificação de reserva -> snapshot no banco."""
+import asyncio
+import logging
+
+import httpx
+
+from .ckan import fetch_all_records
+from .config import Settings
+from .db import Database
+from .geo import Geocoder
+from .normalize import normalize_records
+
+log = logging.getLogger("vemsus.sync")
+_lock = asyncio.Lock()
+
+
+async def run_sync(
+    settings: Settings,
+    db: Database,
+    ckan_transport: httpx.AsyncBaseTransport | None = None,
+    geo_transport: httpx.AsyncBaseTransport | None = None,
+) -> dict:
+    if _lock.locked():
+        return {"ok": False, "error": "sincronização já em andamento"}
+    async with _lock:
+        log_id = db.log_start()
+        diag: dict | None = None
+        try:
+            records = await fetch_all_records(settings, ckan_transport)
+            units, diag = normalize_records(records, settings)
+            if not units:
+                raise RuntimeError("Nenhuma unidade válida após a normalização.")
+
+            geocoder = Geocoder(settings, db, geo_transport)
+            geocoded = 0
+            for u in units:
+                if u["lat"] is None:
+                    coords = await geocoder.geocode(u["address"], u["neighborhood"])
+                    if coords:
+                        u["lat"], u["lng"], u["geo_source"] = coords[0], coords[1], "geocoded"
+                        geocoded += 1
+            diag["geocoded"] = geocoded
+
+            without_geo = sum(1 for u in units if u["lat"] is None)
+            diag["without_geo"] = without_geo
+            db.replace_units(units)  # só troca o snapshot se tudo acima deu certo
+            db.log_finish(log_id, True, len(units), without_geo, None, diag)
+            log.info("sync ok: %s unidades (%s sem coordenada)", len(units), without_geo)
+            return {"ok": True, "units": len(units), "without_geo": without_geo, "geocoded": geocoded}
+        except Exception as exc:  # noqa: BLE001 - registramos e mantemos o último snapshot bom
+            log.exception("sync falhou")
+            db.log_finish(log_id, False, 0, 0, str(exc), diag)
+            return {"ok": False, "error": str(exc)}
+
+import asyncio
+import logging
+import secrets
+import time
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from .config import Settings, get_settings
+from .db import Database
+from .search import public_unit, search_units
+from .sync import run_sync
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("vemsus")
+
+UNIT_TYPES = ["USF", "UBS", "Centro de Saúde", "Policlínica", "CAPS", "UPA", "SAMU", "Maternidade", "Hospital", "Centro Especializado"]
+SERVICE_TAGS = [
+    "Vacinação", "Urgência", "Atenção Básica", "Saúde Mental", "Saúde Bucal", "Saúde da Criança", "Saúde da Mulher",
+    "Saúde do Idoso", "Farmácia", "Exames", "Curativos", "Pré-natal", "Planejamento Familiar", "Doenças Crônicas",
+    "Reabilitação", "Especialidades", "Puericultura", "Hipertensão e Diabetes",
+]
+
+
+class State:
+    db: Database
+    units: list[dict] = []
+
+    def reload(self) -> None:
+        self.units = self.db.all_units()
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    cfg = settings or get_settings()
+    state = State()
+
+    async def _periodic():
+        while True:
+            await asyncio.sleep(cfg.sync_interval_hours * 3600)
+            await run_sync(cfg, state.db)
+            state.reload()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        state.db = Database(cfg.database_path)
+        state.reload()
+        tasks = []
+        if cfg.sync_on_startup:
+            async def first():
+                await run_sync(cfg, state.db)
+                state.reload()
+            tasks.append(asyncio.create_task(first()))
+        if cfg.sync_interval_hours:
+            tasks.append(asyncio.create_task(_periodic()))
+        yield
+        for t in tasks:
+            t.cancel()
+
+    app = FastAPI(title="VemSUS API", version="1.0.0", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
+    app.state.vemsus = state
+    app.add_middleware(CORSMiddleware, allow_origins=cfg.cors_origins, allow_methods=["GET"], allow_headers=["*"])
+
+    # --- limite de requisições por IP (só em memória; nenhum IP é gravado) e cabeçalhos de segurança
+    hits: dict[str, deque] = defaultdict(deque)
+
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        if request.url.path.startswith("/api/"):
+            ip = request.client.host if request.client else "?"
+            if cfg.trust_proxy and request.headers.get("x-forwarded-for"):
+                ip = request.headers["x-forwarded-for"].split(",")[0].strip()
+            now, window = time.monotonic(), hits[ip]
+            while window and now - window[0] > 60:
+                window.popleft()
+            if len(window) >= cfg.rate_limit_per_minute:
+                return JSONResponse({"detail": "Muitas requisições. Tente de novo em instantes."}, status_code=429)
+            window.append(now)
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "geolocation=(self), camera=(), microphone=()"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"  # a query pode conter a localização do usuário
+        return response
+
+    @app.get("/api/health")
+    def health():
+        return {"status": "ok", "units_loaded": len(state.units)}
+
+    @app.get("/api/units")
+    def list_units(
+        q: str = Query("", max_length=100),
+        services: list[str] = Query(default=[]),
+        type: str | None = Query(default=None, max_length=40),
+        child: bool = False,
+        lat: float | None = Query(default=None, ge=-90, le=90),
+        lng: float | None = Query(default=None, ge=-180, le=180),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ):
+        if (lat is None) != (lng is None):
+            raise HTTPException(422, "Informe lat e lng juntos.")
+        if type and type not in UNIT_TYPES:
+            raise HTTPException(422, "Tipo de unidade inválido.")
+        bad = [s for s in services if s not in SERVICE_TAGS]
+        if bad:
+            raise HTTPException(422, f"Serviço desconhecido: {bad[0]}")
+        total, units = search_units(state.units, q, services, type, child, lat, lng, limit)
+        return {"total": total, "units": units}
+
+    @app.get("/api/units/{unit_id}")
+    def get_unit(unit_id: str):
+        for u in state.units:
+            if u["id"] == unit_id and u["lat"] is not None:
+                return public_unit(u)
+        raise HTTPException(404, "Unidade não encontrada.")
+
+    @app.get("/api/services")
+    def services():
+        return {"services": SERVICE_TAGS, "unitTypes": UNIT_TYPES}
+
+    @app.get("/api/meta")
+    def meta():
+        last = state.db.last_sync(only_ok=True)
+        return {
+            "source": "Prefeitura do Recife — Portal de Dados Abertos",
+            "dataset": "Rede de atenção à saúde no Recife",
+            "datasetUrl": f"{cfg.ckan_base_url}/dataset/rede-de-atencao-a-saude-no-recife",
+            "license": "ODbL — Open Data Commons Open Database License",
+            "unitsServed": sum(1 for u in state.units if u["lat"] is not None),
+            "unitsWithoutLocation": sum(1 for u in state.units if u["lat"] is None),
+            "approximateLocation": sum(1 for u in state.units if u["geo_source"] == "geocoded"),
+            "lastSync": last["finished_at"] if last else None,
+            "ready": bool(state.units),
+        }
+
+    def require_admin(x_admin_token: str | None = Header(default=None)):
+        if not cfg.admin_token or not x_admin_token or not secrets.compare_digest(x_admin_token, cfg.admin_token):
+            raise HTTPException(403, "Não autorizado.")
+
+    @app.post("/api/admin/sync", dependencies=[Depends(require_admin)])
+    async def admin_sync():
+        result = await run_sync(cfg, state.db)
+        state.reload()
+        return result
+
+    @app.get("/api/admin/diagnostico", dependencies=[Depends(require_admin)])
+    def diagnostico():
+        """Mostra o que o normalizador não reconheceu (valores de tipo_unidade, coordenadas inválidas...)."""
+        return state.db.last_sync() or {}
+
+    static = Path(cfg.static_dir).resolve() if cfg.static_dir else None
+    if static and static.is_dir():
+        app.mount("/", StaticFiles(directory=static, html=True), name="site")
+    return app
+
+
+app = create_app()
+
+"""Transforma as linhas cruas do dataset (uma linha por unidade x serviço) em unidades do VemSUS."""
+import hashlib
+import re
+import unicodedata
+from collections import Counter, defaultdict
+
+from .config import Settings
+from .geo import validate_coords
+
+NO_ADDRESS = "Informação não disponível na base oficial."
+
+
+def fold(text) -> str:
+    """minúsculas, sem acento, espaços normalizados."""
+    if text is None:
+        return ""
+    txt = unicodedata.normalize("NFKD", str(text))
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", txt).strip().lower()
+
+
+def clean(text) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip() if text is not None else ""
+
+
+def _row(raw: dict) -> dict:
+    """Chaves sem acento ('endereço' -> 'endereco'), para tolerar variações do portal."""
+    return {fold(k).replace(" ", "_"): v for k, v in raw.items()}
+
+
+# ---------------------------------------------------------------- tipo de unidade
+# Ordem importa: do mais específico para o mais genérico. Usa palavras inteiras
+# (o protótipo usava 'includes', e "upa" casava com "ocupacional").
+TYPE_RULES: list[tuple[str, re.Pattern]] = [
+    ("SAMU", re.compile(r"\bsamu\b|atendimento movel")),
+    ("UPA", re.compile(r"\bupa\b|pronto atend")),
+    ("CAPS", re.compile(r"\bcaps\b|psicossocial")),
+    ("Maternidade", re.compile(r"maternidade")),
+    ("Hospital", re.compile(r"hospital")),
+    ("Policlínica", re.compile(r"policlinica")),
+    ("USF", re.compile(r"\busf\b|saude da familia|\besf\b")),
+    ("UBS", re.compile(r"\bubs\b|unidade basica|posto de saude")),
+    ("Centro Especializado", re.compile(r"especializad|\bceo\b|\bcer\b|\bcem\b")),
+    ("Centro de Saúde", re.compile(r"centro de saude")),
+]
+
+
+def detect_unit_type(tipo_unidade: str, nome: str) -> tuple[str, bool]:
+    """Devolve (tipo, reconhecido). Procura primeiro no campo tipo_unidade, depois no nome."""
+    for source in (fold(tipo_unidade), fold(nome)):
+        for unit_type, pattern in TYPE_RULES:
+            if source and pattern.search(source):
+                return unit_type, True
+    return "Centro de Saúde", False
+
+
+# ---------------------------------------------------------------- serviços
+SERVICE_RULES: list[tuple[str, re.Pattern]] = [
+    ("Vacinação", re.compile(r"vacin|imuniza")),
+    ("Urgência", re.compile(r"urgenc|emergenc|pronto atend|pronto.socorro")),
+    ("Atenção Básica", re.compile(r"atencao basica|atencao primaria|saude da familia|clinico geral|clinica medica")),
+    ("Saúde Mental", re.compile(r"mental|psicolog|psiquiatr|psicossocial")),
+    ("Saúde Bucal", re.compile(r"bucal|odonto|dentist|dental")),
+    ("Saúde da Criança", re.compile(r"crianca|pediatr|infantil")),
+    ("Puericultura", re.compile(r"puericult")),
+    ("Saúde da Mulher", re.compile(r"mulher|ginecolog|obstetr")),
+    ("Saúde do Idoso", re.compile(r"idoso|geriatr")),
+    ("Farmácia", re.compile(r"farmaci|dispensacao")),
+    ("Exames", re.compile(r"exame|laborator|ultrassom|ultrasson|radiolog|raio.?x|diagnostic|patologia clinica|mamograf")),
+    ("Curativos", re.compile(r"curativo")),
+    ("Pré-natal", re.compile(r"pre.?natal")),
+    ("Planejamento Familiar", re.compile(r"planejamento (familiar|reprodutivo)")),
+    ("Doenças Crônicas", re.compile(r"cronic|hipertens|diabet")),
+    ("Hipertensão e Diabetes", re.compile(r"hipertens|diabet")),
+    ("Reabilitação", re.compile(r"reabilit|fisioterap|fonoaudi|terapia ocupacional")),
+    (
+        "Especialidades",
+        re.compile(r"especialidade|cardiolog|ortoped|dermatolog|oftalmolog|neurolog|endocrin|urolog|otorrino|reumatolog|nefrolog|gastro|pneumolog"),
+    ),
+]
+
+# Serviços inerentes ao tipo de unidade (documentado; NÃO é um "default" para todas as unidades).
+TYPE_IMPLIED_SERVICES = {
+    "USF": ["Atenção Básica"],
+    "UBS": ["Atenção Básica"],
+    "UPA": ["Urgência"],
+    "SAMU": ["Urgência"],
+    "CAPS": ["Saúde Mental"],
+    "Policlínica": ["Especialidades"],
+    "Centro Especializado": ["Especialidades"],
+}
+
+
+def detect_services(unit_type: str, service_texts: list[str]) -> list[str]:
+    found: set[str] = set(TYPE_IMPLIED_SERVICES.get(unit_type, []))
+    for text in service_texts:
+        folded = fold(text)
+        for tag, pattern in SERVICE_RULES:
+            if pattern.search(folded):
+                found.add(tag)
+    order = {tag: i for i, (tag, _) in enumerate(SERVICE_RULES)}
+    return sorted(found, key=lambda t: order.get(t, 99))
+
+
+# ---------------------------------------------------------------- agrupamento
+def _unique(values: list[str]) -> list[str]:
+    seen, out = set(), []
+    for v in values:
+        key = fold(v)
+        if v and key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
+
+
+def _unit_key(row: dict) -> str:
+    cnes = clean(row.get("cnes"))
+    cnes = re.sub(r"\.0+$", "", cnes)  # numeric vindo como 2400030.0
+    if cnes and cnes != "0":
+        return f"cnes-{cnes}"
+    base = f"{fold(row.get('nome_oficial'))}|{fold(row.get('endereco'))}"
+    return "h-" + hashlib.sha1(base.encode()).hexdigest()[:12]
+
+
+def normalize_records(records: list[dict], settings: Settings) -> tuple[list[dict], dict]:
+    """Agrupa as linhas por unidade. Devolve (unidades, diagnóstico).
+    Unidades sem coordenada válida saem com lat/lng = None (o Geocoder tenta resolver depois)."""
+    exclude = [fold(p) for p in settings.exclude_type_patterns.split(",") if p.strip()]
+    groups: dict[str, list[dict]] = defaultdict(list)
+    diag = {
+        "rows": len(records),
+        "rows_skipped_no_name": 0,
+        "rows_skipped_excluded_type": 0,
+        "unmapped_type_values": Counter(),
+        "coords_fixed": 0,
+        "coords_invalid": 0,
+    }
+
+    for raw in records:
+        row = _row(raw)
+        if not clean(row.get("nome_oficial")):
+            diag["rows_skipped_no_name"] += 1
+            continue
+        if any(p in fold(row.get("tipo_unidade")) for p in exclude):
+            diag["rows_skipped_excluded_type"] += 1
+            continue
+        groups[_unit_key(row)].append(row)
+
+    units: list[dict] = []
+    for key, rows in groups.items():
+        first = rows[0]
+        name = clean(first.get("nome_oficial"))
+        tipo_raw = clean(first.get("tipo_unidade"))
+        unit_type, recognized = detect_unit_type(tipo_raw, name)
+        if not recognized:
+            diag["unmapped_type_values"][tipo_raw or "(vazio)"] += 1
+
+        address = next((clean(r.get("endereco")) for r in rows if clean(r.get("endereco"))), "")
+        neighborhood = next((clean(r.get("bairro")) for r in rows if clean(r.get("bairro"))), "")
+        phone = next((clean(r.get("fone")) for r in rows if clean(r.get("fone"))), "")
+        schedule = " · ".join(_unique([clean(r.get("horario")) for r in rows]))
+        how_to = " ".join(_unique([clean(r.get("como_usar")) for r in rows]))
+
+        service_texts = [clean(r.get("tipo_servico")) for r in rows] + [clean(r.get("especialidade")) for r in rows]
+        services = detect_services(unit_type, service_texts)
+
+        coords = None
+        for r in rows:
+            coords = validate_coords(settings, r.get("latitude"), r.get("longitude"))
+            if coords:
+                raw_lat = r.get("latitude")
+                if str(raw_lat).strip().replace(",", ".") != str(coords[0]):
+                    diag["coords_fixed"] += 1
+                break
+        if not coords:
+            diag["coords_invalid"] += 1
+
+        units.append(
+            {
+                "id": key,
+                "cnes": key[5:] if key.startswith("cnes-") else None,
+                "name": name,
+                "type": unit_type,
+                "address": address or NO_ADDRESS,
+                "neighborhood": neighborhood,
+                "phone": phone or None,
+                "schedule": schedule or None,
+                "lat": coords[0] if coords else None,
+                "lng": coords[1] if coords else None,
+                "geo_source": "official" if coords else "missing",
+                "services": services,
+                "before_visit": how_to or None,
+            }
+        )
+
+    diag["unmapped_type_values"] = dict(diag["unmapped_type_values"].most_common(30))
+    diag["units"] = len(units)
+    return units, diag
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # --- Portal de Dados Abertos do Recife (CKAN) ---
+    ckan_base_url: str = "https://dados.recife.pe.gov.br"
+    ckan_api_path: str = "/api/3/action"
+    ckan_resource_id: str = "c960077b-640c-4cbc-9fac-01be82bf54d9"
+    ckan_api_token: str | None = None  # NUNCA vai para o frontend
+    ckan_page_size: int = 1000
+    ckan_timeout_s: float = 30.0
+
+    # --- Armazenamento / sincronização ---
+    database_path: str = "data/vemsus.db"
+    sync_on_startup: bool = True
+    sync_interval_hours: int = 24
+
+    # --- API ---
+    admin_token: str | None = None  # habilita POST /api/admin/sync
+    allowed_origins: str = "http://localhost:5173,http://localhost:8443"
+    static_dir: str | None = "../frontend/dist"  # serve o site buildado
+    trust_proxy: bool = False  # true atrás do Caddy/Nginx (usa X-Forwarded-For)
+    rate_limit_per_minute: int = 120
+
+    # --- Georreferenciamento ---
+    # Caixa que contém o Recife (+ margem). Coordenadas fora dela são tratadas como erro de cadastro.
+    geo_min_lat: float = -8.25
+    geo_max_lat: float = -7.85
+    geo_min_lng: float = -35.10
+    geo_max_lng: float = -34.80
+    geocode_enabled: bool = True
+    nominatim_url: str = "https://nominatim.openstreetmap.org/search"
+    # Política do Nominatim exige identificação real. TROQUE pelo seu contato.
+    nominatim_user_agent: str = "VemSUS/1.0 (contato@seudominio.com.br)"
+    geocode_max_per_sync: int = 60
+    geocode_retry_days: int = 30
+
+    # Tipos que existem no dataset mas não são unidades de atendimento
+    exclude_type_patterns: str = "academia da cidade"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+"""Busca e ranking. Corrige o protótipo: termo vazio não pontua, acentos são ignorados,
+várias palavras funcionam, e o score é calculado uma vez por unidade."""
+import math
+
+from .normalize import NO_ADDRESS, fold
+from .synonyms import SERVICE_SYNONYMS
+
+STOPWORDS = {"de", "da", "do", "das", "dos", "e", "em", "na", "no", "para", "por", "um", "uma", "com", "perto"}
+CHILD_SERVICES = {"Saúde da Criança", "Vacinação", "Puericultura", "Saúde Bucal"}
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    r = 6371.0
+    d_lat, d_lng = math.radians(lat2 - lat1), math.radians(lng2 - lng1)
+    a = math.sin(d_lat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng / 2) ** 2
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _terms(query: str) -> tuple[str, list[str], set[str]]:
+    """(frase normalizada, palavras, serviços implícitos). Aceita 'dentista', 'saude mental', 'vacina crianca'."""
+    phrase = fold(query)
+    words = [w for w in phrase.split(" ") if len(w) >= 2 and w not in STOPWORDS]
+    wanted: set[str] = set(SERVICE_SYNONYMS.get(phrase, []))
+    for w in words:
+        wanted.update(SERVICE_SYNONYMS.get(w, []))
+    return phrase, words, wanted
+
+
+def score_unit(unit: dict, phrase: str, words: list[str], wanted: set[str], distance_km: float | None) -> int:
+    score = 0
+    if phrase:
+        svc_folded = [fold(s) for s in unit["services"]]
+        if wanted & set(unit["services"]) or phrase in svc_folded:
+            score += 50
+        elif any(w in s for w in words for s in svc_folded):
+            score += 30
+        if phrase in fold(unit["name"]) or any(w in fold(unit["name"]) for w in words):
+            score += 20
+    if unit.get("schedule"):
+        score += 10
+    if unit.get("phone"):
+        score += 5
+    if unit["address"] != NO_ADDRESS:
+        score += 10
+    if distance_km is not None:
+        score += 20 if distance_km < 2 else 10 if distance_km < 5 else 0
+    return score
+
+
+def _matches_text(unit: dict, phrase: str, words: list[str], wanted: set[str]) -> bool:
+    haystack = " ".join([fold(unit["name"]), fold(unit.get("neighborhood")), fold(unit["address"]),
+                         " ".join(fold(s) for s in unit["services"])])
+    if phrase in haystack or wanted & set(unit["services"]):
+        return True
+    return any(w in haystack for w in words)
+
+
+def search_units(
+    units: list[dict],
+    query: str = "",
+    services: list[str] | None = None,
+    unit_type: str | None = None,
+    child_mode: bool = False,
+    lat: float | None = None,
+    lng: float | None = None,
+    limit: int = 200,
+) -> tuple[int, list[dict]]:
+    phrase, words, wanted = _terms(query)
+    results: list[tuple[int, float | None, dict]] = []
+    for u in units:
+        if u["lat"] is None or u["lng"] is None:
+            continue
+        if child_mode and not CHILD_SERVICES & set(u["services"]):
+            continue
+        if unit_type and u["type"] != unit_type:
+            continue
+        if services and not all(s in u["services"] for s in services):
+            continue
+        if phrase and not _matches_text(u, phrase, words, wanted):
+            continue
+        dist = haversine_km(lat, lng, u["lat"], u["lng"]) if lat is not None and lng is not None else None
+        results.append((score_unit(u, phrase, words, wanted, dist), dist, u))
+
+    results.sort(key=lambda t: (-t[0], t[1] if t[1] is not None else 1e9, t[2]["name"]))
+    out = []
+    for _score, dist, u in results[:limit]:
+        item = public_unit(u)
+        if dist is not None:
+            item["distanceKm"] = round(dist, 2)
+        out.append(item)
+    return len(results), out
+
+
+def public_unit(u: dict) -> dict:
+    """Formato idêntico ao HealthUnit do frontend (types.ts)."""
+    return {
+        "id": u["id"], "cnes": u.get("cnes"), "name": u["name"], "type": u["type"], "address": u["address"],
+        "neighborhood": u.get("neighborhood") or "", "phone": u.get("phone") or None,
+        "schedule": u.get("schedule") or None, "lat": u["lat"], "lng": u["lng"], "services": u["services"],
+        "beforeVisit": u.get("before_visit") or None, "status": "active",
+        "dataSource": "official", "geoSource": u["geo_source"],
+    }
+
+"""Dicionário de busca (termo popular -> serviços). Portado de data/mock.ts (SERVICE_MAP)."""
+
+SERVICE_SYNONYMS: dict[str, list[str]] = {
+    "vacinacao": ["Vacinação"],
+    "vacina": ["Vacinação"],
+    "urgencia": ["Urgência"],
+    "emergencia": ["Urgência"],
+    "pronto socorro": ["Urgência"],
+    "saude mental": ["Saúde Mental"],
+    "psicologo": ["Saúde Mental"],
+    "psiquiatra": ["Saúde Mental"],
+    "caps": ["Saúde Mental"],
+    "odontologico": ["Saúde Bucal"],
+    "dentista": ["Saúde Bucal"],
+    "saude bucal": ["Saúde Bucal"],
+    "pre-natal": ["Pré-natal", "Saúde da Mulher"],
+    "gestante": ["Pré-natal", "Saúde da Mulher"],
+    "curativo": ["Curativos"],
+    "farmacia": ["Farmácia"],
+    "remedio": ["Farmácia"],
+    "medicamento": ["Farmácia"],
+    "crianca": ["Saúde da Criança", "Puericultura"],
+    "pediatrico": ["Saúde da Criança"],
+    "pediatria": ["Saúde da Criança"],
+    "consulta": ["Atenção Básica"],
+    "exame": ["Exames"],
+    "laboratorio": ["Exames"],
+    "especialidade": ["Especialidades"],
+    "atencao basica": ["Atenção Básica"],
+    "hipertensao": ["Hipertensão e Diabetes", "Doenças Crônicas"],
+    "diabetes": ["Hipertensão e Diabetes", "Doenças Crônicas"],
+    "idoso": ["Saúde do Idoso"],
+    "planejamento familiar": ["Planejamento Familiar"],
+    "reabilitacao": ["Reabilitação"],
+    "fisioterapia": ["Reabilitação"],
+}
+
+"""Cliente do CKAN do Recife (datastore_search), com paginação e retentativas."""
+import asyncio
+
+import httpx
+
+from .config import Settings
+
+
+class CkanError(RuntimeError):
+    pass
+
+
+async def fetch_all_records(
+    settings: Settings, transport: httpx.AsyncBaseTransport | None = None
+) -> list[dict]:
+    url = f"{settings.ckan_base_url.rstrip('/')}{settings.ckan_api_path}/datastore_search"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if settings.ckan_api_token:
+        headers["Authorization"] = settings.ckan_api_token
+
+    records: list[dict] = []
+    offset = 0
+    async with httpx.AsyncClient(
+        timeout=settings.ckan_timeout_s, transport=transport, follow_redirects=True
+    ) as client:
+        for _page in range(500):  # trava de segurança
+            body = {
+                "resource_id": settings.ckan_resource_id,
+                "limit": settings.ckan_page_size,
+                "offset": offset,
+            }
+            payload = await _post(client, url, headers, body)
+            result = payload.get("result") or {}
+            page = result.get("records") or []
+            records.extend(page)
+            offset += len(page)
+            total = result.get("total")
+            if not page or (isinstance(total, int) and offset >= total):
+                break
+    if not records:
+        raise CkanError("O CKAN respondeu sem registros.")
+    return records
+
+
+async def _post(client: httpx.AsyncClient, url: str, headers: dict, body: dict) -> dict:
+    last: Exception | None = None
+    for attempt in range(4):
+        try:
+            resp = await client.post(url, headers=headers, json=body)
+            if resp.status_code >= 500 or resp.status_code == 429:
+                raise CkanError(f"HTTP {resp.status_code}")
+            if resp.status_code in (401, 403):
+                raise CkanError(f"Acesso negado pelo CKAN (HTTP {resp.status_code}). Verifique CKAN_API_TOKEN.")
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("success"):
+                raise CkanError(f"CKAN retornou success=false: {data.get('error')}")
+            return data
+        except (httpx.HTTPError, CkanError, ValueError) as exc:
+            last = exc
+            if isinstance(exc, CkanError) and "negado" in str(exc):
+                break  # não adianta tentar de novo
+            await asyncio.sleep(0.5 * 2**attempt)
+    raise CkanError(f"Falha ao consultar o CKAN: {last}")
+
+"""SQLite (arquivo único). O catálogo é um *snapshot* da base oficial; nada de dado pessoal é gravado."""
+import json
+import sqlite3
+import threading
+import time
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS units (
+  id TEXT PRIMARY KEY, cnes TEXT, name TEXT NOT NULL, type TEXT NOT NULL,
+  address TEXT NOT NULL, neighborhood TEXT, phone TEXT, schedule TEXT,
+  lat REAL, lng REAL, geo_source TEXT NOT NULL, services TEXT NOT NULL,
+  before_visit TEXT, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_units_type ON units(type);
+CREATE TABLE IF NOT EXISTS geocode_cache (
+  key TEXT PRIMARY KEY, lat REAL, lng REAL, fetched_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT,
+  ok INTEGER, units_saved INTEGER, without_geo INTEGER, error TEXT, diagnostics TEXT
+);
+"""
+
+
+class Database:
+    def __init__(self, path: str):
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.Lock()
+        with self.lock:
+            self.conn.executescript(SCHEMA)
+
+    # ---- unidades
+    def replace_units(self, units: list[dict]) -> None:
+        """Troca o snapshot de forma atômica. Chamado só quando há unidades (nunca apaga o último bom)."""
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rows = [
+            (
+                u["id"], u["cnes"], u["name"], u["type"], u["address"], u["neighborhood"], u["phone"],
+                u["schedule"], u["lat"], u["lng"], u["geo_source"], json.dumps(u["services"], ensure_ascii=False),
+                u["before_visit"], now,
+            )
+            for u in units
+        ]
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM units")
+            self.conn.executemany("INSERT INTO units VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+
+    def all_units(self) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute("SELECT * FROM units").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["services"] = json.loads(d["services"])
+            out.append(d)
+        return out
+
+    # ---- cache de geocodificação ((lat,lng) | () = falha conhecida | None = sem entrada)
+    def geocode_cache_get(self, key: str, retry_days: int):
+        with self.lock:
+            r = self.conn.execute("SELECT lat,lng,fetched_at FROM geocode_cache WHERE key=?", (key,)).fetchone()
+        if not r:
+            return None
+        if r["lat"] is None:
+            return () if time.time() - r["fetched_at"] < retry_days * 86400 else None
+        return (r["lat"], r["lng"])
+
+    def geocode_cache_put(self, key: str, coords) -> None:
+        lat, lng = coords if coords else (None, None)
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO geocode_cache VALUES (?,?,?,?)", (key, lat, lng, time.time())
+            )
+
+    # ---- log de sincronização
+    def log_start(self) -> int:
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO sync_log(started_at) VALUES (?)", (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),)
+            )
+            return int(cur.lastrowid)
+
+    def log_finish(self, log_id: int, ok: bool, saved: int, without_geo: int, error: str | None, diag: dict | None):
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE sync_log SET finished_at=?, ok=?, units_saved=?, without_geo=?, error=?, diagnostics=? WHERE id=?",
+                (
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), int(ok), saved, without_geo, error,
+                    json.dumps(diag, ensure_ascii=False) if diag else None, log_id,
+                ),
+            )
+
+    def last_sync(self, only_ok: bool = False) -> dict | None:
+        q = "SELECT * FROM sync_log " + ("WHERE ok=1 " if only_ok else "") + "ORDER BY id DESC LIMIT 1"
+        with self.lock:
+            r = self.conn.execute(q).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["diagnostics"] = json.loads(d["diagnostics"]) if d["diagnostics"] else None
+        return d
