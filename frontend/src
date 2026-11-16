@@ -1,0 +1,436 @@
+import type { HealthUnit, ServiceTag, UnitType } from '../types';
+import { MOCK_UNITS, SERVICE_MAP } from '../data/mock';
+
+/**
+ * O frontend NÃO fala mais com dados.recife.pe.gov.br e NÃO tem token.
+ * Quem consulta a Prefeitura é o backend Python (/api); aqui só consumimos o nosso próprio /api.
+ */
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '';
+// Dados fictícios só existem se você pedir explicitamente (VITE_ALLOW_MOCK=true) — nunca em produção.
+const ALLOW_MOCK = import.meta.env.VITE_ALLOW_MOCK === 'true';
+
+export const NO_ADDRESS = 'Informação não disponível na base oficial.';
+
+export class ApiError extends Error {}
+
+type Coords = { lat: number; lng: number } | null;
+
+export interface UnitQuery {
+  q?: string;
+  services?: ServiceTag[];
+  type?: UnitType | '';
+  child?: boolean;
+  location?: Coords;
+  limit?: number;
+}
+
+async function getJson<T>(path: string, params?: URLSearchParams, signal?: AbortSignal): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}${params ? `?${params}` : ''}`, { signal });
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') throw e;
+    throw new ApiError('Não foi possível conectar ao servidor. Verifique sua internet e tente novamente.');
+  }
+  if (res.status === 429) throw new ApiError('Muitas buscas seguidas. Aguarde alguns segundos e tente de novo.');
+  if (!res.ok) throw new ApiError('O serviço está temporariamente indisponível. Tente novamente em instantes.');
+  return res.json() as Promise<T>;
+}
+
+/** Busca no servidor (ranking e distância calculados lá). Preferir esta função nas telas. */
+export async function searchUnits(query: UnitQuery, signal?: AbortSignal): Promise<{ total: number; units: HealthUnit[] }> {
+  const p = new URLSearchParams();
+  if (query.q?.trim()) p.set('q', query.q.trim());
+  query.services?.forEach(s => p.append('services', s));
+  if (query.type) p.set('type', query.type);
+  if (query.child) p.set('child', 'true');
+  if (query.location) {
+    p.set('lat', String(query.location.lat));
+    p.set('lng', String(query.location.lng));
+  }
+  if (query.limit) p.set('limit', String(query.limit));
+  return getJson('/api/units', p, signal);
+}
+
+/** Carrega todas as unidades georreferenciadas (mantém a assinatura antiga usada pelo app). */
+export async function fetchUnits(): Promise<{ units: HealthUnit[]; isMock: boolean }> {
+  try {
+    const { units } = await searchUnits({ limit: 1000 });
+    if (units.length === 0) throw new ApiError('Os dados das unidades ainda estão sendo carregados. Tente novamente em instantes.');
+    return { units, isMock: false };
+  } catch (e) {
+    if (ALLOW_MOCK) return { units: MOCK_UNITS, isMock: true };
+    throw e; // a tela mostra o erro; nunca exibimos endereços fictícios como se fossem reais
+  }
+}
+
+export interface DataMeta {
+  source: string;
+  dataset: string;
+  datasetUrl: string;
+  license: string;
+  unitsServed: number;
+  unitsWithoutLocation: number;
+  approximateLocation: number;
+  lastSync: string | null;
+}
+export const fetchMeta = () => getJson<DataMeta>('/api/meta');
+
+// ---------------------------------------------------------------------------------------------
+// Utilitários mantidos por compatibilidade (modo local/offline). Bugs do protótipo corrigidos.
+// ---------------------------------------------------------------------------------------------
+const fold = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+const STOP = new Set(['de', 'da', 'do', 'das', 'dos', 'e', 'em', 'na', 'no', 'para', 'por', 'um', 'uma', 'com', 'perto']);
+
+const SYNONYMS: Record<string, string[]> = Object.fromEntries(
+  Object.entries(SERVICE_MAP).map(([k, v]) => [fold(k), v as string[]]),
+);
+
+function terms(query: string) {
+  const phrase = fold(query);
+  const words = phrase.split(/\s+/).filter(w => w.length >= 2 && !STOP.has(w));
+  const wanted = new Set<string>(SYNONYMS[phrase] ?? []);
+  words.forEach(w => (SYNONYMS[w] ?? []).forEach(s => wanted.add(s)));
+  return { phrase, words, wanted };
+}
+
+export function scoreUnit(unit: HealthUnit, searchTerm: string, userLocation: Coords): number {
+  const { phrase, words, wanted } = terms(searchTerm);
+  let score = 0;
+
+  if (phrase) {
+    // Correção: com termo vazio o protótipo fazia includes('') === true e dava +30 a todas as unidades.
+    const svc = unit.services.map(fold);
+    if (unit.services.some(s => wanted.has(s)) || svc.includes(phrase)) score += 50;
+    else if (words.some(w => svc.some(s => s.includes(w)))) score += 30;
+    const name = fold(unit.name);
+    if (name.includes(phrase) || words.some(w => name.includes(w))) score += 20;
+  }
+  if (unit.schedule) score += 10;
+  if (unit.phone) score += 5;
+  if (unit.address !== NO_ADDRESS) score += 10;
+
+  if (userLocation) {
+    const dist = haversine(userLocation.lat, userLocation.lng, unit.lat, unit.lng);
+    if (dist < 2) score += 20;
+    else if (dist < 5) score += 10;
+  }
+  return score;
+}
+
+export function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+const CHILD_SERVICES: ServiceTag[] = ['Saúde da Criança', 'Vacinação', 'Puericultura', 'Saúde Bucal'];
+
+export function filterAndSort(
+  units: HealthUnit[],
+  searchTerm: string,
+  selectedServices: ServiceTag[],
+  selectedUnitType: UnitType | '',
+  childMode: boolean,
+  userLocation: Coords,
+): HealthUnit[] {
+  const { phrase, words, wanted } = terms(searchTerm);
+  let list = units;
+  if (childMode) list = list.filter(u => u.services.some(s => CHILD_SERVICES.includes(s)));
+  if (selectedUnitType) list = list.filter(u => u.type === selectedUnitType);
+  if (selectedServices.length) list = list.filter(u => selectedServices.every(s => u.services.includes(s)));
+  if (phrase) {
+    list = list.filter(u => {
+      const hay = fold([u.name, u.neighborhood, u.address, ...u.services].join(' '));
+      return hay.includes(phrase) || u.services.some(s => wanted.has(s)) || words.some(w => hay.includes(w));
+    });
+  }
+  // Correção: calcula o score uma única vez por unidade (antes era recalculado a cada comparação do sort).
+  return list
+    .map(u => ({ u, s: scoreUnit(u, searchTerm, userLocation) }))
+    .sort((a, b) => b.s - a.s || a.u.name.localeCompare(b.u.name, 'pt-BR'))
+    .map(x => x.u);
+}
+
+import type { HealthUnit } from '../types';
+
+export const MOCK_UNITS: HealthUnit[] = [
+  {
+    id: 'usf-alto-ceu',
+    name: 'USF Alto do Céu',
+    type: 'USF',
+    address: 'Rua Manoel de Almeida Braga, 158',
+    neighborhood: 'Alto do Céu',
+    phone: '(81) 3355-0001',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0800,
+    lng: -34.9100,
+    services: ['Atenção Básica', 'Vacinação', 'Saúde da Criança', 'Pré-natal', 'Saúde Bucal', 'Hipertensão e Diabetes', 'Puericultura'],
+    beforeVisit: 'Não é necessário agendamento para consulta básica. Leve RG, CPF e cartão do SUS. Atendimento por ordem de chegada.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'usf-torroes',
+    name: 'USF Torrões',
+    type: 'USF',
+    address: 'Rua Francisco Coelho, 320',
+    neighborhood: 'Torrões',
+    phone: '(81) 3355-0012',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0780,
+    lng: -34.9350,
+    services: ['Atenção Básica', 'Vacinação', 'Saúde da Mulher', 'Pré-natal', 'Planejamento Familiar', 'Saúde Bucal'],
+    beforeVisit: 'Leve documentos pessoais e cartão SUS. Consultas de pré-natal com agendamento prévio.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'ubs-varzea',
+    name: 'UBS Várzea',
+    type: 'UBS',
+    address: 'Rua Antônio Falcão, 780',
+    neighborhood: 'Várzea',
+    phone: '(81) 3355-0023',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0610,
+    lng: -34.9450,
+    services: ['Atenção Básica', 'Vacinação', 'Exames', 'Farmácia', 'Doenças Crônicas', 'Saúde do Idoso', 'Curativos'],
+    beforeVisit: 'Exames laboratoriais mediante solicitação médica. Farmácia atende com receita.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'caps-centro',
+    name: 'CAPS Centro',
+    type: 'CAPS',
+    address: 'Rua da Aurora, 455',
+    neighborhood: 'Boa Vista',
+    phone: '(81) 3355-0034',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0624,
+    lng: -34.8958,
+    services: ['Saúde Mental', 'Reabilitação', 'Especialidades'],
+    beforeVisit: 'Atendimento mediante encaminhamento da atenção básica. Entre em contato para agendar avaliação.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'upa-imbiribeira',
+    name: 'UPA Imbiribeira',
+    type: 'UPA',
+    address: 'Av. Engenheiro Domingos Ferreira, 4050',
+    neighborhood: 'Imbiribeira',
+    phone: '(81) 3355-0045',
+    schedule: '24 horas — 7 dias por semana',
+    lat: -8.1120,
+    lng: -34.9160,
+    services: ['Urgência', 'Curativos', 'Exames'],
+    beforeVisit: 'Atendimento por classificação de risco. Não necessita agendamento. Leve documentos pessoais.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'policlinica-goiana',
+    name: 'Policlínica Goiana',
+    type: 'Policlínica',
+    address: 'Rua Gervásio Pires, 680',
+    neighborhood: 'Boa Vista',
+    phone: '(81) 3355-0056',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0635,
+    lng: -34.8990,
+    services: ['Especialidades', 'Exames', 'Reabilitação', 'Saúde da Mulher', 'Saúde do Idoso'],
+    beforeVisit: 'Atendimento somente mediante encaminhamento das unidades básicas de saúde.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'maternidade-bandeira',
+    name: 'Maternidade Bandeira Filho',
+    type: 'Maternidade',
+    address: 'Rua Joaquim Nabuco, 300',
+    neighborhood: 'Derby',
+    phone: '(81) 3355-0067',
+    schedule: '24 horas — 7 dias por semana',
+    lat: -8.0580,
+    lng: -34.8880,
+    services: ['Saúde da Mulher', 'Pré-natal', 'Urgência'],
+    beforeVisit: 'Parto e urgências obstétricas. Consultas de pré-natal com encaminhamento da USF/UBS.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'usf-brasilit',
+    name: 'USF Brasilit',
+    type: 'USF',
+    address: 'Rua Brasilit, 145',
+    neighborhood: 'Casa Amarela',
+    phone: '(81) 3355-0078',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0270,
+    lng: -34.9310,
+    services: ['Atenção Básica', 'Vacinação', 'Saúde da Criança', 'Puericultura', 'Farmácia', 'Curativos'],
+    beforeVisit: 'Vacinação por demanda espontânea. Demais serviços por ordem de chegada ou agendamento.',
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'centro-saude-madalena',
+    name: 'Centro de Saúde Madalena',
+    type: 'Centro de Saúde',
+    address: 'Rua Siqueira Campos, 120',
+    neighborhood: 'Madalena',
+    phone: '(81) 3355-0089',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0490,
+    lng: -34.9120,
+    services: ['Atenção Básica', 'Vacinação', 'Farmácia', 'Exames', 'Doenças Crônicas', 'Hipertensão e Diabetes', 'Saúde Bucal'],
+    status: 'active',
+    dataSource: 'mock',
+  },
+  {
+    id: 'usf-sancho',
+    name: 'USF Sancho',
+    type: 'USF',
+    address: 'Rua do Sancho, 500',
+    neighborhood: 'Sancho',
+    phone: '(81) 3355-0090',
+    schedule: 'Segunda a Sexta: 07h às 17h',
+    lat: -8.0390,
+    lng: -34.9560,
+    services: ['Atenção Básica', 'Vacinação', 'Saúde da Criança', 'Saúde Mental', 'Pré-natal'],
+    status: 'active',
+    dataSource: 'mock',
+  },
+];
+
+export const SERVICE_MAP: Record<string, string[]> = {
+  'vacinação': ['Vacinação'],
+  'vacina': ['Vacinação'],
+  'urgência': ['Urgência'],
+  'emergência': ['Urgência'],
+  'pronto socorro': ['Urgência'],
+  'saúde mental': ['Saúde Mental'],
+  'psicólogo': ['Saúde Mental'],
+  'psiquiatra': ['Saúde Mental'],
+  'caps': ['Saúde Mental'],
+  'odontológico': ['Saúde Bucal'],
+  'dentista': ['Saúde Bucal'],
+  'saúde bucal': ['Saúde Bucal'],
+  'pré-natal': ['Pré-natal', 'Saúde da Mulher'],
+  'gestante': ['Pré-natal', 'Saúde da Mulher'],
+  'curativo': ['Curativos'],
+  'farmácia': ['Farmácia'],
+  'remédio': ['Farmácia'],
+  'medicamento': ['Farmácia'],
+  'criança': ['Saúde da Criança', 'Puericultura'],
+  'pediátrico': ['Saúde da Criança'],
+  'pediatria': ['Saúde da Criança'],
+  'consulta': ['Atenção Básica'],
+  'exame': ['Exames'],
+  'laboratório': ['Exames'],
+  'especialidade': ['Especialidades'],
+  'atenção básica': ['Atenção Básica'],
+  'hipertensão': ['Hipertensão e Diabetes', 'Doenças Crônicas'],
+  'diabetes': ['Hipertensão e Diabetes', 'Doenças Crônicas'],
+  'idoso': ['Saúde do Idoso'],
+  'planejamento familiar': ['Planejamento Familiar'],
+  'reabilitação': ['Reabilitação'],
+  'fisioterapia': ['Reabilitação'],
+};
+
+export type UnitType =
+  | 'USF'
+  | 'UBS'
+  | 'Centro de Saúde'
+  | 'Policlínica'
+  | 'CAPS'
+  | 'UPA'
+  | 'SAMU'
+  | 'Maternidade'
+  | 'Hospital'
+  | 'Centro Especializado';
+
+export type ServiceTag =
+  | 'Vacinação'
+  | 'Urgência'
+  | 'Atenção Básica'
+  | 'Saúde Mental'
+  | 'Saúde Bucal'
+  | 'Saúde da Criança'
+  | 'Saúde da Mulher'
+  | 'Saúde do Idoso'
+  | 'Farmácia'
+  | 'Exames'
+  | 'Curativos'
+  | 'Pré-natal'
+  | 'Planejamento Familiar'
+  | 'Doenças Crônicas'
+  | 'Reabilitação'
+  | 'Especialidades'
+  | 'Puericultura'
+  | 'Hipertensão e Diabetes';
+
+export interface HealthUnit {
+  id: string;
+  name: string;
+  type: UnitType;
+  address: string;
+  neighborhood: string;
+  phone?: string;
+  schedule?: string;
+  lat: number;
+  lng: number;
+  services: ServiceTag[];
+  beforeVisit?: string;
+  status: 'active' | 'unknown';
+  cnes?: string;
+  geoSource?: 'official' | 'geocoded'; // 'geocoded' = posição aproximada (avisar o usuário)
+  distanceKm?: number; // calculado pelo servidor quando a localização é enviada
+  dataSource: 'official' | 'mock';
+}
+
+export interface AppState {
+  searchTerm: string;
+  selectedServices: ServiceTag[];
+  selectedUnitType: UnitType | '';
+  childMode: boolean;
+  userLocation: { lat: number; lng: number } | null;
+  units: HealthUnit[];
+  filteredUnits: HealthUnit[];
+  selectedUnit: HealthUnit | null;
+  theme: 'light' | 'dark';
+  view: 'home' | 'results' | 'unit' | 'samu' | 'about' | 'privacy';
+  loading: boolean;
+  error: string | null;
+  mockMode: boolean;
+  accessibilitySettings: {
+    fontSize: 'normal' | 'large' | 'xlarge';
+    highContrast: boolean;
+    simplifiedUI: boolean;
+    reducedMotion: boolean;
+  };
+}
+
+export type AppAction =
+  | { type: 'SET_SEARCH'; payload: string }
+  | { type: 'SET_SERVICES'; payload: ServiceTag[] }
+  | { type: 'TOGGLE_SERVICE'; payload: ServiceTag }
+  | { type: 'SET_UNIT_TYPE'; payload: UnitType | '' }
+  | { type: 'SET_CHILD_MODE'; payload: boolean }
+  | { type: 'SET_LOCATION'; payload: { lat: number; lng: number } | null }
+  | { type: 'SET_UNITS'; payload: HealthUnit[] }
+  | { type: 'SET_FILTERED'; payload: HealthUnit[] }
+  | { type: 'SELECT_UNIT'; payload: HealthUnit | null }
+  | { type: 'SET_THEME'; payload: 'light' | 'dark' }
+  | { type: 'SET_VIEW'; payload: AppState['view'] }
+  | { type: 'SET_LOADING'; payload: boolean }
+  | { type: 'SET_ERROR'; payload: string | null }
+  | { type: 'SET_MOCK_MODE'; payload: boolean }
+  | { type: 'SET_ACCESSIBILITY'; payload: Partial<AppState['accessibilitySettings']> }
+  | { type: 'SEARCH' };
